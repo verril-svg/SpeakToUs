@@ -1,0 +1,336 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>SpeakToUs - Sign Language (Tunarungu) Demo</title>
+  <style>
+    body { font-family: system-ui, Arial; display:flex; gap:20px; padding:20px; align-items:flex-start }
+    #left { display:flex; flex-direction:column; gap:8px }
+    video { border-radius:8px; transform:scaleX(-1); -webkit-transform:scaleX(-1); }
+    canvas { display:none }
+    .big { font-size:20px; font-weight:600 }
+    #pred { background:#f3f3f3; padding:12px; border-radius:8px; min-width:320px }
+    button { padding:8px 12px; border-radius:6px }
+    #status { font-weight:600 }
+    #overlay { position:absolute; left:20px; top:20px; pointer-events:none; }
+    #container { position:relative }
+  </style>
+</head>
+<body>
+  <div id="left">
+    <div id="container">
+      <video id="webcam" autoplay playsinline width="480" height="360"></video>
+      <canvas id="overlay" width="480" height="360"></canvas>
+    </div>
+    <div>
+      <button id="start">Start</button>
+      <button id="stop">Stop</button>
+      <button id="calibrate">Kalibrasi (reset buffer)</button>
+    </div>
+  </div>
+
+  <div id="right">
+    <div id="pred">Model: <span id="modelStatus">loading…</span></div>
+    <div style="margin-top:12px" class="big">Prediction: <span id="label">—</span></div>
+    <div style="margin-top:6px">Confidence: <span id="conf">—</span></div>
+    <div style="margin-top:12px"><button id="speak">Speak prediction</button></div>
+    <div style="margin-top:12px">Status kamera: <span id="camStatus">idle</span></div>
+  </div>
+
+  <!-- TensorFlow.js -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.11.0/dist/tf.min.js"></script>
+
+  <!-- MediaPipe Holistic & Camera utils -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/holistic/holistic.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+
+<script>
+/*
+  Petunjuk singkat:
+  - Letakkan model.json & binary di folder yang sama dengan HTML
+  - (opsional) labels.json di folder yang sama berisi array JSON label, mis. ["halo","apa","kabar",...]
+  - Model expect shape [1,30,225]
+*/
+
+const MODEL_PATH = 'model.json';        // model.json (layers-model) yang kamu upload
+const LABELS_PATH = 'labels.json';      // optional
+const SEQ_LEN = 30;
+const FEATURES = 225; // 33*3 + 21*3 + 21*3 = 225
+
+let model = null;
+let labels = null;
+
+const video = document.getElementById('webcam');
+const overlay = document.getElementById('overlay');
+const octx = overlay.getContext('2d');
+const labelEl = document.getElementById('label');
+const confEl = document.getElementById('conf');
+const modelStatus = document.getElementById('modelStatus');
+const camStatus = document.getElementById('camStatus');
+
+let camera = null;
+let holistic = null;
+let running = false;
+
+// circular buffer for frames (each frame = Float32Array length 225)
+const buffer = [];
+function pushFrame(arr){
+  if(buffer.length >= SEQ_LEN) buffer.shift();
+  buffer.push(arr);
+}
+function isBufferReady(){ return buffer.length === SEQ_LEN; }
+function getBufferTensor(){
+  // shape [1, SEQ_LEN, FEATURES]
+  const flat = new Float32Array(SEQ_LEN * FEATURES);
+  for(let i=0;i<SEQ_LEN;i++){
+    flat.set(buffer[i], i * FEATURES);
+  }
+  return tf.tensor(flat, [1, SEQ_LEN, FEATURES]);
+}
+
+// try load labels.json if exists
+async function loadLabels(){
+  try{
+    const res = await fetch(LABELS_PATH, {cache:'no-store'});
+    if(!res.ok) throw new Error('no labels');
+    labels = await res.json();
+    console.log('labels loaded', labels.length);
+  }catch(e){
+    console.warn('labels.json not found — menggunakan label numerik sementara');
+    labels = null;
+  }
+}
+
+async function loadModel(){
+  modelStatus.innerText = 'loading model...';
+  try{
+    // prefer tf.loadLayersModel for "layers-model" format
+    model = await tf.loadLayersModel(MODEL_PATH);
+    modelStatus.innerText = 'model loaded';
+  }catch(e){
+    console.error(e);
+    modelStatus.innerText = 'failed to load model';
+    alert('Gagal memuat model. Pastikan model.json berada di folder yang sama dan diakses lewat http/https (bukan file://).');
+  }
+}
+
+// MediaPipe setup
+function setupHolistic(){
+  holistic = new Holistic({
+    locateFile: (file) => {
+      // mediapipe base url from CDN
+      return `https://cdn.jsdelivr.net/npm/@mediapipe/holistic/${file}`;
+    }
+  });
+  holistic.setOptions({
+    modelComplexity: 1,
+    smoothLandmarks: true,
+    enableSegmentation: false,
+    refineFaceLandmarks: false,
+    minDetectionConfidence: 0.5,
+    minTrackingConfidence: 0.5
+  });
+  holistic.onResults(onResults);
+}
+
+// extract 225 features in order: pose(33)*(x,y,z) then leftHand(21)*(x,y,z) then rightHand(21)*(x,y,z)
+// if missing landmarks, fill with zeros
+function extractFeatures(results){
+  // results.poseLandmarks (array of 33), results.leftHandLandmarks (21), results.rightHandLandmarks (21)
+  const out = new Float32Array(FEATURES);
+  let idx = 0;
+  const pose = results.poseLandmarks || [];
+  const left = results.leftHandLandmarks || [];
+  const right = results.rightHandLandmarks || [];
+
+  // pose: 33
+  for(let i=0;i<33;i++){
+    const p = pose[i];
+    if(p){
+      out[idx++] = p.x ?? 0;
+      out[idx++] = p.y ?? 0;
+      out[idx++] = p.z ?? 0;
+    }else{
+      out[idx++] = 0; out[idx++] = 0; out[idx++] = 0;
+    }
+  }
+  // left hand: 21
+  for(let i=0;i<21;i++){
+    const p = left[i];
+    if(p){
+      out[idx++] = p.x ?? 0;
+      out[idx++] = p.y ?? 0;
+      out[idx++] = p.z ?? 0;
+    }else{
+      out[idx++] = 0; out[idx++] = 0; out[idx++] = 0;
+    }
+  }
+  // right hand: 21
+  for(let i=0;i<21;i++){
+    const p = right[i];
+    if(p){
+      out[idx++] = p.x ?? 0;
+      out[idx++] = p.y ?? 0;
+      out[idx++] = p.z ?? 0;
+    }else{
+      out[idx++] = 0; out[idx++] = 0; out[idx++] = 0;
+    }
+  }
+
+  return out;
+}
+
+// draw simple landmarks for visual feedback
+function drawLandmarks(results){
+  octx.clearRect(0,0,overlay.width, overlay.height);
+  octx.save();
+  octx.scale(-1,1);
+  octx.translate(-overlay.width,0);
+
+  // draw pose
+  if(results.poseLandmarks){
+    octx.fillStyle = 'rgba(0,160,200,0.8)';
+    for(const p of results.poseLandmarks){
+      octx.beginPath();
+      octx.arc(p.x * overlay.width, p.y * overlay.height, 3, 0, 2*Math.PI);
+      octx.fill();
+    }
+  }
+  // left hand
+  if(results.leftHandLandmarks){
+    octx.fillStyle = 'rgba(200,50,120,0.9)';
+    for(const p of results.leftHandLandmarks){
+      octx.beginPath();
+      octx.arc(p.x * overlay.width, p.y * overlay.height, 3, 0, 2*Math.PI);
+      octx.fill();
+    }
+  }
+  // right hand
+  if(results.rightHandLandmarks){
+    octx.fillStyle = 'rgba(80,200,100,0.9)';
+    for(const p of results.rightHandLandmarks){
+      octx.beginPath();
+      octx.arc(p.x * overlay.width, p.y * overlay.height, 3, 0, 2*Math.PI);
+      octx.fill();
+    }
+  }
+  octx.restore();
+}
+
+let lastPredictAt = 0;
+const PRED_INTERVAL = 120; // ms between predictions to reduce load
+
+async function onResults(results){
+  if(!running) return;
+  drawLandmarks(results);
+  const feat = extractFeatures(results);
+  pushFrame(feat);
+
+  const now = performance.now();
+  if(model && isBufferReady() && now - lastPredictAt > PRED_INTERVAL){
+    lastPredictAt = now;
+    // prepare tensor and predict
+    const t = getBufferTensor(); // shape [1,30,225]
+    tf.tidy(()=>{
+      const logits = model.predict(t);
+      let probs = logits;
+      // model may return tensor or array
+      if(Array.isArray(logits)) probs = logits[0];
+      const data = probs.dataSync(); // length = numClasses
+      let maxIdx = 0;
+      let maxVal = data[0];
+      for(let i=1;i<data.length;i++){
+        if(data[i] > maxVal){ maxVal = data[i]; maxIdx = i; }
+      }
+      const label = labels ? (labels[maxIdx] ?? `${maxIdx}`) : `${maxIdx}`;
+      labelEl.innerText = label;
+      confEl.innerText = (maxVal * 100).toFixed(1) + '%';
+    });
+    t.dispose && t.dispose();
+  }
+}
+
+// camera start/stop
+async function startCamera(){
+  camStatus.innerText = 'starting...';
+  const constraints = {video:{width:480, height:360, facingMode:'user'}, audio:false};
+  try{
+    const stream = await navigator.mediaDevices.getUserMedia(constraints);
+    video.srcObject = stream;
+    await video.play();
+
+    // adjust overlay size to video
+    overlay.width = video.videoWidth || 480;
+    overlay.height = video.videoHeight || 360;
+
+    // setup MediaPipe Camera
+    camera = new Camera(video, {
+      onFrame: async () => {
+        await holistic.send({image: video});
+      },
+      width: overlay.width,
+      height: overlay.height
+    });
+    camera.start();
+    camStatus.innerText = 'running';
+    running = true;
+  }catch(e){
+    console.error(e);
+    alert('Gagal membuka kamera. Pastikan izinkan akses kamera pada halaman ini dan jangan menggunakan file:// (pakai server lokal).');
+    camStatus.innerText = 'error';
+  }
+}
+
+function stopCamera(){
+  running = false;
+  camStatus.innerText = 'stopped';
+  if(camera) {
+    try{ camera.stop(); }catch(e){ console.warn(e); }
+    camera = null;
+  }
+  if(video && video.srcObject){
+    video.srcObject.getTracks().forEach(t=>t.stop());
+    video.srcObject = null;
+  }
+  octx.clearRect(0,0,overlay.width, overlay.height);
+}
+
+// init sequence: load labels & model & mediapipe
+async function initAll(){
+  await loadLabels();
+  await loadModel();
+  setupHolistic();
+  modelStatus.innerText = model ? 'ready' : 'no model';
+}
+
+// UI handlers
+document.getElementById('start').addEventListener('click', async ()=>{
+  if(!model) await loadModel();
+  if(!holistic) setupHolistic();
+  if(!running) await startCamera();
+});
+
+document.getElementById('stop').addEventListener('click', async ()=>{
+  stopCamera();
+});
+
+document.getElementById('calibrate').addEventListener('click', ()=>{
+  buffer.length = 0;
+  labelEl.innerText = '—';
+  confEl.innerText = '—';
+});
+
+document.getElementById('speak').addEventListener('click', ()=>{
+  const text = labelEl.innerText;
+  if(!text || text === '—') return;
+  const ut = new SpeechSynthesisUtterance(text);
+  speechSynthesis.speak(ut);
+});
+
+// kick off
+initAll();
+
+</script>
+</body>
+</html>
